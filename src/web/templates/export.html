@@ -28,6 +28,49 @@
   </p>
 </div>
 
+<div id="batch-panel" class="config-panel" style="margin-top:16px">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+    <div>
+      <h3 style="margin:0 0 4px 0">📦 批量群聊导出</h3>
+      <div style="color:#8b949e;font-size:12px">适合一次导出几十个工作群；选择会保存在当前浏览器，下次可直接恢复。</div>
+    </div>
+    <div style="color:#8b949e;font-size:12px">已选 <b id="batch-selected-count" style="color:#58a6ff">0</b> 个群</div>
+  </div>
+
+  <div class="batch-toolbar">
+    <input id="batch-search" placeholder="搜索群名或 @chatroom ID">
+    <button id="batch-refresh" class="btn">刷新群聊</button>
+    <button id="batch-select-filtered" class="btn">全选当前结果</button>
+    <button id="batch-clear" class="btn">清空选择</button>
+    <button id="batch-save-set" class="btn">保存为“工作群”</button>
+    <button id="batch-load-set" class="btn">加载“工作群”</button>
+  </div>
+
+  <div id="batch-list" class="batch-list">
+    <div class="batch-empty">点击“刷新群聊”加载群聊列表</div>
+  </div>
+
+  <div class="form-row" style="margin-top:14px">
+    <div style="flex:1"><label>开始日期</label><input id="batch-start" type="date"></div>
+    <div style="flex:1"><label>结束日期</label><input id="batch-end" type="date"></div>
+    <div style="flex:1.4"><label>格式</label><select id="batch-format">
+      <option value="chatlab-jsonl">ChatLab JSONL（推荐 / 支持续传）</option>
+      <option value="chatlab-json">ChatLab JSON</option>
+      <option value="txt">TXT 文本</option>
+      <option value="html">HTML</option>
+    </select></div>
+    <div><label>&nbsp;</label><button id="batch-run" class="btn btn-primary">批量导出 ZIP</button></div>
+  </div>
+
+  <div id="batch-progress" class="progress-panel" style="display:none;margin-top:14px">
+    <div class="progress-bar-outer"><div id="batch-progress-bar" class="progress-bar-inner" style="width:0%"></div></div>
+    <div id="batch-progress-detail" class="progress-detail">等待开始...</div>
+    <div id="batch-log" class="log-console" style="margin-top:12px"></div>
+  </div>
+
+  <div id="batch-result" class="result-panel" style="display:none;margin-top:14px"></div>
+</div>
+
 <div id="progress-container" class="progress-panel" style="display:none">
   <div class="progress-bar-outer"><div id="progress-bar" class="progress-bar-inner" style="width:0%"></div></div>
   <div id="progress-detail" class="progress-detail">等待开始...</div>
@@ -59,6 +102,23 @@
 .select-item:hover { background: #0f3460; border-color: #e94560; }
 .select-name { color: #eee; font-size: 15px; font-weight: 500; }
 .select-count { color: #8b949e; font-size: 12px; }
+.batch-toolbar { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+.batch-toolbar input { min-width:280px; flex:1; }
+.batch-list {
+  margin-top:10px; border:1px solid #30363d; border-radius:8px;
+  max-height:380px; overflow:auto; background:#0d1117;
+}
+.batch-row {
+  display:flex; align-items:center; gap:10px; padding:9px 12px;
+  border-bottom:1px solid #21262d; cursor:pointer;
+}
+.batch-row:last-child { border-bottom:none; }
+.batch-row:hover { background:#161b22; }
+.batch-row input { width:16px; height:16px; }
+.batch-row-main { min-width:0; flex:1; }
+.batch-row-name { color:#eee; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.batch-row-id { color:#6e7681; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.batch-empty { color:#8b949e; text-align:center; padding:24px; font-size:13px; }
 </style>
 {% endblock %}
 {% block scripts %}
@@ -77,5 +137,176 @@ new WizardPage({
     format: document.getElementById('cfg-format').value,
   }),
 });
+
+const batchState = {
+  chats: [],
+  selected: new Set(JSON.parse(localStorage.getItem('wechat_exp_batch_selected') || '[]')),
+};
+
+function batchPersist() {
+  localStorage.setItem('wechat_exp_batch_selected', JSON.stringify([...batchState.selected]));
+  document.getElementById('batch-selected-count').textContent = batchState.selected.size;
+}
+
+function batchFiltered() {
+  const q = document.getElementById('batch-search').value.trim().toLowerCase();
+  if (!q) return batchState.chats;
+  return batchState.chats.filter(c =>
+    (c.display_name || '').toLowerCase().includes(q) ||
+    (c.username || '').toLowerCase().includes(q));
+}
+
+function renderBatchList() {
+  const list = document.getElementById('batch-list');
+  const rows = batchFiltered();
+  if (!rows.length) {
+    list.innerHTML = '<div class="batch-empty">没有匹配的群聊</div>';
+    batchPersist();
+    return;
+  }
+  list.innerHTML = '';
+  for (const chat of rows) {
+    const row = document.createElement('label');
+    row.className = 'batch-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = batchState.selected.has(chat.username);
+    cb.addEventListener('change', () => {
+      if (cb.checked) batchState.selected.add(chat.username);
+      else batchState.selected.delete(chat.username);
+      batchPersist();
+    });
+    const main = document.createElement('div');
+    main.className = 'batch-row-main';
+    const name = document.createElement('div');
+    name.className = 'batch-row-name';
+    name.textContent = chat.display_name || chat.username;
+    const id = document.createElement('div');
+    id.className = 'batch-row-id';
+    id.textContent = chat.username;
+    main.appendChild(name);
+    main.appendChild(id);
+    row.appendChild(cb);
+    row.appendChild(main);
+    list.appendChild(row);
+  }
+  batchPersist();
+}
+
+async function loadBatchChats() {
+  const btn = document.getElementById('batch-refresh');
+  btn.disabled = true;
+  btn.textContent = '加载中...';
+  try {
+    const resp = await fetch('/api/export/chats?groups_only=1');
+    const data = await resp.json();
+    if (!resp.ok || !data.success) throw new Error(data.error || '加载失败');
+    batchState.chats = data.chats || [];
+    renderBatchList();
+    btn.textContent = '刷新群聊 (' + batchState.chats.length + ')';
+  } catch (e) {
+    document.getElementById('batch-list').innerHTML =
+      '<div class="batch-empty">加载失败：' + String(e.message || e) + '</div>';
+    btn.textContent = '刷新群聊';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('batch-search').addEventListener('input', renderBatchList);
+document.getElementById('batch-refresh').addEventListener('click', loadBatchChats);
+document.getElementById('batch-select-filtered').addEventListener('click', () => {
+  for (const chat of batchFiltered()) batchState.selected.add(chat.username);
+  batchPersist();
+  renderBatchList();
+});
+document.getElementById('batch-clear').addEventListener('click', () => {
+  batchState.selected.clear();
+  batchPersist();
+  renderBatchList();
+});
+document.getElementById('batch-save-set').addEventListener('click', () => {
+  localStorage.setItem('wechat_exp_work_groups', JSON.stringify([...batchState.selected]));
+  alert('已保存“工作群”集合：' + batchState.selected.size + ' 个群');
+});
+document.getElementById('batch-load-set').addEventListener('click', () => {
+  const saved = JSON.parse(localStorage.getItem('wechat_exp_work_groups') || '[]');
+  batchState.selected = new Set(saved);
+  batchPersist();
+  renderBatchList();
+});
+
+document.getElementById('batch-run').addEventListener('click', () => {
+  if (!batchState.selected.size) {
+    alert('请至少选择一个群聊');
+    return;
+  }
+  const runBtn = document.getElementById('batch-run');
+  const progress = document.getElementById('batch-progress');
+  const bar = document.getElementById('batch-progress-bar');
+  const detail = document.getElementById('batch-progress-detail');
+  const log = document.getElementById('batch-log');
+  const result = document.getElementById('batch-result');
+
+  runBtn.disabled = true;
+  progress.style.display = 'block';
+  result.style.display = 'none';
+  log.innerHTML = '';
+  bar.style.width = '0%';
+  detail.textContent = '正在准备...';
+
+  const appendLog = (msg, cls) => {
+    const line = document.createElement('div');
+    line.className = 'log-line ' + (cls || '');
+    line.textContent = msg;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  const sse = new SseProgress('/api/export/chat-batch', {
+    body: {
+      chats: [...batchState.selected],
+      date_start: document.getElementById('batch-start').value,
+      date_end: document.getElementById('batch-end').value,
+      format: document.getElementById('batch-format').value,
+      resume: true,
+    },
+    onProgress: data => {
+      const p = data.progress || 0;
+      bar.style.width = Math.round(p * 100) + '%';
+      detail.textContent = data.detail || '';
+      appendLog(data.detail || '');
+    },
+    onDone: data => {
+      const r = data.result || data;
+      bar.style.width = '100%';
+      detail.textContent = '完成';
+      runBtn.disabled = false;
+      result.style.display = 'block';
+      result.innerHTML = '';
+      const title = document.createElement('h3');
+      title.textContent = '✓ 批量导出完成';
+      const summary = document.createElement('p');
+      summary.style.color = '#8b949e';
+      summary.textContent = (r.note || '') + '；累计 ' + (r.msg_count || 0).toLocaleString() + ' 条消息';
+      const link = document.createElement('a');
+      link.href = r.download_url;
+      link.textContent = '📥 下载 ZIP (' + (r.filename || '') + ')';
+      link.style.cssText = 'color:#58a6ff;font-size:15px;text-decoration:none;padding:10px 20px;background:#1a1a2e;border:1px solid #30363d;border-radius:8px;display:inline-block';
+      result.appendChild(title);
+      result.appendChild(summary);
+      result.appendChild(link);
+    },
+    onError: err => {
+      runBtn.disabled = false;
+      detail.textContent = '失败';
+      appendLog('✗ ' + err.message, 'error');
+    },
+  });
+  sse.start();
+});
+
+batchPersist();
+loadBatchChats();
 </script>
 {% endblock %}

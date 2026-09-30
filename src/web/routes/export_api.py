@@ -147,6 +147,205 @@ def _scan_chats_flat(decrypted_dir: str, name_filter: str = ""):
     return result
 
 
+@export_bp.route('/chats', methods=['GET'])
+def export_chats():
+    """GET /api/export/chats — Lightweight chat list for batch selection."""
+    decrypted_dir = _decrypted_dir()
+    own_wxid = current_app.config.get('WXID')
+    q = (request.args.get('q') or '').strip().lower()
+    groups_only = request.args.get('groups_only', '1') not in ('0', 'false', 'False')
+    try:
+        from chatlab_pull_server import fast_chat_list
+        chats = fast_chat_list(decrypted_dir, own_wxid=own_wxid)
+        if groups_only:
+            chats = [c for c in chats if c.get('is_group') or str(c.get('username') or '').endswith('@chatroom')]
+        if q:
+            chats = [
+                c for c in chats
+                if q in str(c.get('display_name') or '').lower()
+                or q in str(c.get('username') or '').lower()
+            ]
+        result = [{
+            'username': c.get('username') or '',
+            'display_name': c.get('display_name') or c.get('username') or '',
+            'msg_count': c.get('msg_count') or 0,
+            'is_group': bool(c.get('is_group') or str(c.get('username') or '').endswith('@chatroom')),
+        } for c in chats]
+        return jsonify({'success': True, 'chats': result, 'total': len(result)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@export_bp.route('/chat-batch', methods=['POST'])
+def export_chat_batch():
+    """POST /api/export/chat-batch — Batch export selected chats and return one ZIP."""
+    data = request.get_json(silent=True) or {}
+    chat_ids = data.get('chats') or []
+    if not isinstance(chat_ids, list):
+        return jsonify({'success': False, 'error': 'chats 必须是数组'}), 400
+    chat_ids = [str(x).strip() for x in chat_ids if str(x).strip()]
+    # Preserve order while deduplicating.
+    chat_ids = list(dict.fromkeys(chat_ids))
+    if not chat_ids:
+        return jsonify({'success': False, 'error': '请至少选择一个群聊'}), 400
+    if len(chat_ids) > 200:
+        return jsonify({'success': False, 'error': '单次最多导出 200 个会话'}), 400
+
+    date_start = data.get('date_start', '')
+    date_end = data.get('date_end', '')
+    fmt = (data.get('format') or 'chatlab-jsonl').lower()
+    resume = bool(data.get('resume', True))
+
+    decrypted_dir = _decrypted_dir()
+    own_wxid = current_app.config.get('WXID')
+    push, gen = create_sse_progress()
+
+    def _run():
+        import hashlib
+        import json as _json
+        import shutil
+        import zipfile
+        from engine.constants import TZ
+
+        try:
+            from chatlab_pull_server import fast_chat_list
+            from chat_export import export_chat as _export_chat
+
+            push('export', '正在读取群聊列表...', 0.03)
+            chats = fast_chat_list(decrypted_dir, own_wxid=own_wxid)
+            by_id = {str(c.get('username') or ''): c for c in chats}
+            selected = []
+            missing = []
+            for chat_id in chat_ids:
+                chat = by_id.get(chat_id)
+                if chat:
+                    selected.append(chat)
+                else:
+                    missing.append(chat_id)
+
+            if not selected:
+                push.error('选中的群聊均未在当前备份中找到')
+                return
+
+            start_ts = None
+            end_ts = None
+            if date_start:
+                dt = datetime.strptime(date_start, '%Y-%m-%d').replace(tzinfo=TZ)
+                start_ts = int(dt.timestamp())
+            if date_end:
+                dt = datetime.strptime(date_end, '%Y-%m-%d').replace(
+                    hour=23, minute=59, second=59, tzinfo=TZ)
+                end_ts = int(dt.timestamp())
+
+            out_root = os.path.join(_DATA_ROOT, 'export')
+            cache_root = os.path.join(out_root, 'batch_cache')
+            os.makedirs(cache_root, exist_ok=True)
+
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            batch_dir = os.path.join(out_root, 'batch_' + stamp)
+            os.makedirs(batch_dir, exist_ok=True)
+
+            exported_files = []
+            errors = []
+            total_messages = 0
+            used_names = set()
+
+            for idx, chat in enumerate(selected, 1):
+                chat_id = str(chat.get('username') or '')
+                display = str(chat.get('display_name') or chat_id)
+                safe = re.sub(r'[\\/:*?"<>|\s]+', '_', display).strip('_.') or 'chat'
+                safe = safe[:72]
+                if safe.casefold() in used_names:
+                    safe += '_' + hashlib.sha1(chat_id.encode('utf-8')).hexdigest()[:8]
+                used_names.add(safe.casefold())
+
+                pct = 0.08 + (idx - 1) / max(len(selected), 1) * 0.78
+                push('export', '[%d/%d] 正在导出 %s' % (idx, len(selected), display), pct)
+
+                try:
+                    if fmt.startswith('chatlab'):
+                        from chatlab_export import export_chatlab
+                        sub_fmt = 'json' if fmt.endswith('json') else 'jsonl'
+                        range_key = '%s|%s|%s|%s' % (
+                            chat_id, date_start or '', date_end or '', sub_fmt)
+                        cache_name = hashlib.sha1(range_key.encode('utf-8')).hexdigest() + '.' + sub_fmt
+                        cache_path = os.path.join(cache_root, cache_name)
+                        result = export_chatlab(
+                            decrypted_dir, chat, cache_path, fmt=sub_fmt,
+                            own_wxid=own_wxid, resume=resume,
+                            start_ts=start_ts, end_ts=end_ts,
+                            print_fn=lambda msg: None,
+                        )
+                        total_messages += int(result.get('count_total') or 0)
+                        dest = os.path.join(batch_dir, safe + '.' + sub_fmt)
+                        shutil.copy2(result.get('path') or cache_path, dest)
+                    else:
+                        count, path = _export_chat(
+                            chat, batch_dir,
+                            start_ts=start_ts, end_ts=end_ts,
+                            print_fn=lambda msg: None, fmt=fmt,
+                            display_name=safe,
+                        )
+                        total_messages += int(count or 0)
+                        dest = path
+                    if dest and os.path.isfile(dest):
+                        exported_files.append(dest)
+                    else:
+                        errors.append({'chat': display, 'error': '未生成导出文件'})
+                except Exception as e:
+                    errors.append({'chat': display, 'error': str(e)})
+
+            manifest = {
+                'format': fmt,
+                'date_start': date_start,
+                'date_end': date_end,
+                'selected': len(chat_ids),
+                'matched': len(selected),
+                'missing': missing,
+                'exported': len(exported_files),
+                'errors': errors,
+            }
+            manifest_path = os.path.join(batch_dir, 'manifest.json')
+            with open(manifest_path, 'w', encoding='utf-8') as fh:
+                _json.dump(manifest, fh, ensure_ascii=False, indent=2)
+            exported_files.append(manifest_path)
+
+            zip_name = 'wechat_batch_%s_%d.zip' % (stamp, len(selected))
+            zip_path = os.path.join(out_root, zip_name)
+            push('export', '正在打包 ZIP...', 0.9)
+            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for path in exported_files:
+                    zf.write(path, arcname=os.path.basename(path))
+
+            try:
+                shutil.rmtree(batch_dir)
+            except OSError:
+                pass
+
+            note_parts = ['成功导出 %d/%d 个会话' % (len(exported_files) - 1, len(selected))]
+            if missing:
+                note_parts.append('%d 个会话未找到' % len(missing))
+            if errors:
+                note_parts.append('%d 个会话失败，详见 manifest.json' % len(errors))
+            if fmt == 'chatlab-jsonl':
+                note_parts.append('JSONL 启用缓存续传，中断后重新导出可继续')
+
+            push.done({
+                'msg_count': total_messages,
+                'download_url': '/api/export/download/' + zip_name,
+                'filename': zip_name,
+                'exported': len(exported_files) - 1,
+                'missing': len(missing),
+                'failed': len(errors),
+                'note': '；'.join(note_parts),
+            })
+        except Exception as e:
+            push.error(str(e))
+
+    threading.Thread(target=_run, daemon=True).start()
+    return sse_response(gen)
+
+
 @export_bp.route('/chat', methods=['POST'])
 def export_chat():
     """POST /api/export/chat — Export chat messages."""
