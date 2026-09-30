@@ -322,16 +322,88 @@ def cmd_chatlab_pull(args):
                     token=args.token, print_fn=print)
 
 
+def _load_chat_targets_file(path):
+    """读取批量会话名单：每行一个显示名或会话 ID，忽略空行和 # 注释。"""
+    targets = []
+    seen = set()
+    with open(path, 'r', encoding='utf-8-sig') as fh:
+        for raw in fh:
+            value = raw.strip()
+            if not value or value.startswith('#'):
+                continue
+            if value not in seen:
+                seen.add(value)
+                targets.append(value)
+    return targets
+
+
+def _resolve_chat_targets(chats, targets, groups_only=False):
+    """按会话 ID / 显示名解析批量名单，返回 (selected, missing, ambiguous)。"""
+    if groups_only:
+        chats = [c for c in chats if str(c.get('username') or '').endswith('@chatroom')]
+
+    by_id = {}
+    by_name = {}
+    by_id_fold = {}
+    by_name_fold = {}
+    for chat in chats or []:
+        chat_id = str(chat.get('username') or '').strip()
+        name = str(chat.get('display_name') or chat_id).strip()
+        if chat_id:
+            by_id[chat_id] = chat
+            by_id_fold.setdefault(chat_id.casefold(), []).append(chat)
+        if name:
+            by_name.setdefault(name, []).append(chat)
+            by_name_fold.setdefault(name.casefold(), []).append(chat)
+
+    selected = []
+    missing = []
+    ambiguous = []
+    selected_ids = set()
+    for target in targets or []:
+        if target in by_id:
+            matches = [by_id[target]]
+        elif target in by_name:
+            matches = by_name[target]
+        else:
+            folded = target.casefold()
+            matches = by_id_fold.get(folded, []) or by_name_fold.get(folded, [])
+
+        if not matches:
+            missing.append(target)
+            continue
+
+        uniq = []
+        uniq_ids = set()
+        for chat in matches:
+            chat_id = str(chat.get('username') or '')
+            if chat_id and chat_id not in uniq_ids:
+                uniq_ids.add(chat_id)
+                uniq.append(chat)
+        if len(uniq) > 1:
+            ambiguous.append((target, [x.get('username') for x in uniq]))
+
+        for chat in uniq:
+            chat_id = str(chat.get('username') or '')
+            if chat_id and chat_id not in selected_ids:
+                selected_ids.add(chat_id)
+                selected.append(chat)
+
+    return selected, missing, ambiguous
+
+
 def _export_chatlab_cmd(args):
     """导出 ChatLab 标准格式（支持断点续传）。"""
     from engine.config_file import get_backup_wxid
     from engine.utils import find_all_wechat_data_dirs
-    from chatlab_export import export_all_chatlab
+    from chatlab_export import export_all_chatlab, export_chatlab, _safe_filename
 
     decrypted = args.decrypted_dir or _resolve_decrypted_dir()
     fmt = getattr(args, 'format', None) or 'jsonl'
     resume = not getattr(args, 'no_resume', False)
     name_filter = getattr(args, 'chat', None)
+    chat_file = getattr(args, 'chat_file', None)
+    groups_only = bool(getattr(args, 'groups_only', False))
     out_dir = args.output or os.path.join(decrypted, '..', 'chatlab_export')
 
     if not os.path.isdir(decrypted):
@@ -357,7 +429,81 @@ def _export_chatlab_cmd(args):
     print("  断点续传: " + ("开启（中断后重跑本命令即可继续）" if resume else "关闭"))
     if name_filter:
         print("  过滤: " + str(name_filter))
+    if chat_file:
+        print("  批量名单: " + str(chat_file))
+    if groups_only:
+        print("  仅群聊: 是")
     print()
+
+    if chat_file:
+        if not os.path.isfile(chat_file):
+            print("错误: 批量名单文件不存在: " + str(chat_file))
+            return
+
+        targets = _load_chat_targets_file(chat_file)
+        if not targets:
+            print("错误: 批量名单为空（每行填写一个群名/联系人名或 @chatroom ID）")
+            return
+
+        from chatlab_pull_server import fast_chat_list
+        print("正在读取会话列表...")
+        chats = fast_chat_list(decrypted, own_wxid=own_wxid)
+        selected, missing, ambiguous = _resolve_chat_targets(
+            chats, targets, groups_only=groups_only)
+
+        if ambiguous:
+            print("注意: 以下名称匹配到多个会话，将全部导出：")
+            for name, ids in ambiguous:
+                print("  - %s -> %s" % (name, ", ".join(ids)))
+        if missing:
+            print("未匹配到的会话 (%d):" % len(missing))
+            for name in missing:
+                print("  - " + name)
+        if not selected:
+            print("错误: 名单中没有任何会话匹配成功")
+            return
+
+        os.makedirs(out_dir, exist_ok=True)
+        ext = 'json' if fmt == 'json' else 'jsonl'
+        exported = failed = 0
+        used_names = set()
+
+        for i, chat in enumerate(selected, 1):
+            chat_id = chat.get('username') or ''
+            display = chat.get('display_name') or chat_id
+            safe = _safe_filename(display)
+            dedupe_key = safe.casefold()
+            if dedupe_key in used_names:
+                import hashlib as _hashlib
+                safe = "%s_%s" % (
+                    safe[:48],
+                    _hashlib.sha1(chat_id.encode('utf-8', errors='ignore')).hexdigest()[:8],
+                )
+                dedupe_key = safe.casefold()
+            used_names.add(dedupe_key)
+
+            out_path = os.path.join(out_dir, "%s.%s" % (safe, ext))
+            print("[%d/%d] 导出 %s" % (i, len(selected), display))
+            try:
+                r = export_chatlab(
+                    decrypted, chat, out_path, fmt=fmt, own_wxid=own_wxid,
+                    resume=resume, print_fn=print,
+                    progress_fn=lambda pct, msg: None,
+                )
+                exported += 1
+                tag = "续传" if r.get('resumed') else "新导出"
+                print("  完成: %s，本次 +%d，累计 %d 条"
+                      % (tag, r.get('count_new') or 0, r.get('count_total') or 0))
+            except Exception as e:
+                failed += 1
+                print("  失败: " + str(e))
+
+        print()
+        print("完成: %d 个会话导出, %d 个失败, %d 个未匹配"
+              % (exported, failed, len(missing)))
+        print("输出目录: " + str(out_dir))
+        print("导入 ChatLab：打开 ChatLab → 导入 → 选择输出目录下的 .%s 文件" % ext)
+        return
 
     result = export_all_chatlab(
         decrypted, out_dir, fmt=fmt, own_wxid=own_wxid,
@@ -1064,6 +1210,11 @@ def main():
     ep.add_argument('--chat',
                     help='指定聊天对象 (wordcloud 模式) / 名称过滤 (chat、list 模式) / '
                          '搜索关键词 (contacts 模式)')
+    ep.add_argument('--chat-file',
+                    help='chatlab 模式：批量会话名单文本文件；每行一个群名/联系人名或 @chatroom ID，'
+                         '空行和 # 注释会忽略')
+    ep.add_argument('--groups-only', action='store_true',
+                    help='chatlab 批量模式：只在群聊中匹配名单')
     ep.add_argument('--kind', choices=['all', 'contacts', 'groups'], default='all',
                     help='contacts 模式导出范围 (默认: all)')
     ep.add_argument('--has-chat', action='store_true',
