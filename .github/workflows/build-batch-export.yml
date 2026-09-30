@@ -1,0 +1,68 @@
+name: Build batch export EXE
+
+on:
+  push:
+    branches:
+      - feature/batch-chat-export
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+          pip install pytest
+
+      - name: Run batch export tests
+        shell: pwsh
+        run: |
+          pytest -q tests/test_batch_chat_export.py
+
+      - name: Compile changed modules
+        shell: pwsh
+        run: |
+          python -m py_compile src/main.py src/web/routes/export_api.py
+
+      - name: Build Windows EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --onefile --console --name wechat_exp_batch --version-file file_version_info.txt --add-data "src;src" --add-data "tools\silk_decoder.exe;tools" --add-data "tools\silk_decoder.c;tools" --hidden-import Crypto.Cipher.AES --hidden-import Crypto.Util.Padding --hidden-import flask --hidden-import werkzeug --hidden-import jinja2 --hidden-import blackboxprotobuf --hidden-import zstandard --hidden-import openpyxl --hidden-import jieba --hidden-import jieba.posseg --hidden-import requests --hidden-import zhconv --hidden-import lameenc --hidden-import pypinyin --hidden-import psutil --collect-all zhconv --collect-all jieba --exclude-module pytest --exclude-module _pytest --exclude-module tkinter --exclude-module _tkinter --exclude-module turtle --exclude-module idlelib --exclude-module ensurepip --exclude-module pip --exclude-module setuptools --exclude-module wheel --exclude-module pkg_resources --exclude-module multiprocessing --exclude-module concurrent.futures.process --exclude-module lib2to3 --exclude-module xmlrpc --exclude-module pydoc --exclude-module doctest --exclude-module bdb --strip src\main.py
+
+      - name: Smoke test EXE
+        shell: pwsh
+        run: |
+          .\dist\wechat_exp_batch.exe --version
+
+      - name: SHA256
+        shell: pwsh
+        run: |
+          Get-FileHash .\dist\wechat_exp_batch.exe -Algorithm SHA256 | Format-List | Out-File .\dist\SHA256.txt
+          Get-Content .\dist\SHA256.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wechat_exp_batch_windows
+          path: |
+            dist/wechat_exp_batch.exe
+            dist/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
